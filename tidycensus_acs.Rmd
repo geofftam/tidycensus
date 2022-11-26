@@ -28,10 +28,10 @@ library(leaflet)
 ```
 
 ```{r, include = F}
-ckey <- "5c9ed8f1201d34ca6b21505c0c27382c6e31442d"
+ckey <- "KEY"
 census_api_key(ckey, overwrite = TRUE)
 
-gmap_key <- "AIzaSyD2G2MYfXQM1Z2yr0N0U_gPG1tvrzwOwo4"
+gmap_key <- "KEY"
 ```
 
 View available variables in ACS5 data set for 2019 
