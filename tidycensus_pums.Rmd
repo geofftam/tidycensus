@@ -46,7 +46,7 @@ First we'll download the data from the Census API using the American Community S
 
 Census API key
 ```{r}
-ckey <- "5c9ed8f1201d34ca6b21505c0c27382c6e31442d"
+ckey <- "KEY"
 census_api_key(ckey, overwrite = TRUE)
 ```
 
