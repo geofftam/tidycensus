@@ -1,0 +1,79 @@
+---
+title: "tidycensus_maps"
+author: "Geoff"
+date: '2022-11-20'
+output: html_document
+---
+
+# Introduction
+
+
+Load the necessary packages 
+```{r, warning=F, message=F}
+library(tidycensus)
+library(tidyverse)
+library(shiny)
+library(leaflet)
+```
+
+Census API key
+```{r}
+ckey <- "5c9ed8f1201d34ca6b21505c0c27382c6e31442d"
+census_api_key(ckey, overwrite = TRUE)
+```
+
+View census 2010 variables
+```{r}
+View(load_variables(year = 2010, dataset = "sf1"))
+View(load_variables(year = 2010, dataset = "sf2"))
+```
+
+Race by county 
+```{r}
+va_race <- get_decennial(
+  geography = "county",
+  state = "VA", 
+  variables = c(White = "P003002",
+                Black = "P003003",
+                Native = "P003004", 
+                Asian = "P003005", 
+                HIPI = "P003006", 
+                Other = "P003007",
+                Multiple = "P003008"),
+  summary_var = "P003001",
+  year = 2010, 
+  geometry = TRUE
+) %>%
+  mutate(NAME = str_remove(NAME, " County, Virginia"),
+         percent = round(100 * value/summary_value, 1))
+
+va_asian <- va_race %>%
+#  group_by(NAME) %>%
+  filter(variable == "Asian")
+```
+
+
+```{r}
+pal <- colorNumeric(
+  palette = "magma",
+  domain = va_asian$percent
+)
+
+pal(c(10, 20, 30, 40, 50))
+
+leaflet() %>%
+  addProviderTiles(providers$Stamen.TonerLite) %>%
+  addPolygons(data = va_asian,
+              color = ~pal(percent),
+              weight = 0.5,
+              smoothFactor = 0.2,
+              fillOpacity = 0.5,
+              label = ~percent) %>%
+  addLegend(
+    position = "bottomright",
+    pal = pal,
+    values = va_asian$percent,
+    title = "% asian"
+  )
+```
+

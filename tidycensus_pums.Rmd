@@ -1,0 +1,178 @@
+---
+title: "Tidycensus PUMS"
+author: "Geoff"
+date: '2022-11-22'
+output: html_document
+---
+# Introduction
+
+The ongoing conflict in Ukraine as well as this week's COP27 Conference highlight a common theme of energy security, which inspired me to investigate how the issue plays out locally in my home state of VA. To address this question, I compile a simple social vulnerability index from the [American Community Survey's Public Use Microdata Sample (ACS PUMS)](https://www.census.gov/programs-surveys/acs/library/handbooks/pums.html) using an abbreviated list of indicators compiled by the CDC. Next, I create an energy burden variable to capture what proportion of its annual income a household spends on energy (fuel, gas, electricity). 
+
+Data are summarized and visualized at the Public Use Microdata Area (PUMA) level. 
+
+
+## [Social Vulnerability](https://www.atsdr.cdc.gov/placeandhealth/svi/at-a-glance_svi.html)
+
+* Socioeconomic 
+** below 150% poverty
+** unemployed
+** housing cost burden (pay more than 30% income for housing in rent or mortgage)
+** no high school diploma
+** no health insurance
+
+* Household characteristics 
+** age 65 or older
+** age 17 or younger 
+** disability 
+** limited English household
+
+## Energy Burden 
+
+[PUMS Data Dictionary](https://www.census.gov/programs-surveys/acs/microdata/documentation.2019.html#list-tab-6IH21Z086XPYLLD5BW)
+* ELEP - Electricity cost (monthly)
+* FULP - Fuel cost (yearly cost for fuels other than gas and electricity)
+* GASP - Gas cost (monthly cost)
+
+# Code
+
+Load the necessary packages 
+```{r, warning=F, message=F}
+library(tidycensus)
+library(tidyverse)
+library(srvyr)
+```
+
+First we'll download the data from the Census API using the American Community Survey 5-year estimate. [This dataset](https://www.census.gov/programs-surveys/acs/guidance/estimates.html) provides the most reliable estimates for community characteristics with the largest sample size. 
+
+Census API key
+```{r}
+ckey <- "5c9ed8f1201d34ca6b21505c0c27382c6e31442d"
+census_api_key(ckey, overwrite = TRUE)
+```
+
+View available variables in PUMS dataset for 2019 ACS5
+```{r}
+#PUMS
+View(pums_variables %>%
+  filter(year == 2019, 
+         survey == "acs"))
+
+# ACS5
+View(load_variables(2019, dataset = "acs5"))
+```
+
+
+
+Select variables used for vulnerability index
+```{r}
+acs <- get_pums(variables = c("PUMA",
+                              
+  # Household level 
+  "GRPIP", "OCPIP", "FINCP", "LNGI", 
+  
+  # Individual Level 
+  "AGEP", "POVPIP", "DIS", "ESR", "SCHL", "HICOV",
+  
+  # Energy
+  "ELEP", "FULP", "GASP"),
+  
+                state = "VA", 
+                year = 2019,
+                survey = "acs5",
+                rep_weights = "both",
+                recode = T,
+                key = ckey)
+```
+
+Clean the variables for analysis 
+```{r}
+acs_clean <- acs %>%
+  mutate(hh_housing_burden = ifelse(GRPIP >= 30 | OCPIP >= 30 , 1, 0), # unaffordable housing costs (rent or mortgage)
+         hh_english_limited = ifelse(LNGI == 2, 1, 0),
+         age_elder = ifelse(AGEP >= 65, 1, 0), 
+         age_minor = ifelse(AGEP <= 17, 1, 0), 
+         pov_150_less = ifelse(POVPIP <= 150, 1, 0), 
+         disability = ifelse(DIS == 1, 1, 0), 
+         unemployed = ifelse(ESR == 3, 1, 0), 
+         hs_diploma_no = ifelse(SCHL %in% c(1:15), 1, 0),
+         health_insurance_no = ifelse(HICOV == 2, 1, 0), 
+         hh_energy_year = ELEP*12 + FULP + GASP*12, # annual electricity, fuel and gas bill
+         hh_energy_perc = round((hh_energy_year / FINCP) *100, 0),
+         hh_energy_perc = ifelse(FINCP == 0, 0, hh_energy_perc)) %>%
+  rowwise() %>%
+  mutate(social_vulnerability = sum(across(hh_housing_burden:health_insurance_no), na.rm = T),
+         vulnerable = ifelse(social_vulnerability > 0, 1, 0))
+
+```
+
+Summarize variables at the PUMA level
+```{r}
+# Save as obj
+svy_design <- acs_clean %>% 
+
+# Filter to non missing for the weight
+filter(!is.na(PWGTP)) %>% 
+
+# Set the survey design 
+as_survey_design(id = c(SERIALNO, SPORDER), weights = c(PWGTP)) 
+
+```
+
+## Survey Analysis 
+
+About 66 percent of Virginians display at least one form of social vulnerability 
+```{r}
+svy_design %>%
+  survey_count(social_vulnerability) %>%
+  mutate(prp = round(n/sum(n), 2))
+```
+On average, vulnerable individuals spend about 10 percentage points more of their household income on energy compared to non-vulnerable households.  
+```{r}
+svy_design %>% 
+  group_by(vulnerable) %>%
+  summarise_at(vars(hh_energy_perc), ~survey_mean(.x, na.rm = T))
+```
+
+Using a linear regression model, we see that most social vulnerability indicators are not related to energy burden outside of annual household income and elderly status. These indicators are both statistically significant at the 5% and 10% levels and high in magnitude. This finding is intuitive for low income households (smaller denominator). Elderly individuals spend nearly a quarter   
+```{r}
+model <- survey::svyglm(hh_energy_perc ~ hh_housing_burden + hh_english_limited + age_elder + age_minor + pov_150_less + disability + unemployed + hs_diploma_no + health_insurance_no, design = svy_design)
+
+summary(model)
+```
+
+```{r}
+svy_design %>%
+  survey_count(age_elder, pov_150_less) %>%
+  mutate(prp = round(n/sum(n), 2))
+```
+
+
+## Mapping
+
+Let's map social vulnerability by PUMA 
+```{r}
+puma <- svy_design %>%
+  group_by(PUMA) %>%
+  summarise_at(vars(social_vulnerability, hh_energy_perc, pov_150_less), ~survey_mean(.x, na.rm = T))
+```
+
+Use Tidycensus to retrieve the VA shapefile 
+```{r}
+va <- map("VA", tigris::pumas, class = "sf", cb = TRUE, year = 2019) %>% reduce(rbind)
+```
+
+Map  
+```{r}
+va %>%
+  left_join(puma, by = c("PUMACE10" = "PUMA")) %>%
+  ggplot(aes(fill = pov_150_less)) + 
+  geom_sf() + 
+  scale_fill_viridis_b(
+    name = NULL, 
+    option = "magma", 
+    #labels = scales::label_percent(1)
+  ) + 
+  labs(title = "") + 
+  theme_void()
+```
+

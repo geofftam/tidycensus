@@ -1,0 +1,207 @@
+---
+title: "Exploratory Spatial Data Analysis with R"
+author: "Geoff Tam"
+date: '2022-11-19'
+output: html_document
+---
+
+# Introduction
+This script explores demographic and social data in Northern Virginia following examples provided in [Analyzing US Census Data: Methods, Maps, and Models in R](https://walker-data.com/census-r/index.html) and [Google Maps API tutorial (paywall)](https://towardsdatascience.com/how-to-use-the-google-maps-places-api-in-r-33f2b705b2c). 
+
+# Code
+
+```{r, include = F}
+knitr::opts_chunk$set(warning=F, message=F)
+```
+
+Load the necessary packages 
+```{r}
+library(tidycensus)
+library(tidyverse)
+library(patchwork)
+library(ggiraph)
+library(scales)
+library(googleway)
+library(sf)
+library(spdep)
+library(leaflet)
+```
+
+```{r, include = F}
+ckey <- "5c9ed8f1201d34ca6b21505c0c27382c6e31442d"
+census_api_key(ckey, overwrite = TRUE)
+
+gmap_key <- "AIzaSyD2G2MYfXQM1Z2yr0N0U_gPG1tvrzwOwo4"
+```
+
+View available variables in ACS5 data set for 2019 
+```{r, eval = F}
+# ACS5
+View(load_variables(2019, dataset = "acs5"))
+```
+
+When I arrived in NOVA from New England, something I noticed right away was the diversity of food options, especially Peruvian chicken. Let's use the Google Maps API and shapefiles from the tigris package to visualize chicken restaurants in my local area. 
+
+Retrieve shapefiles for local counties from tigris. 
+```{r, results=F}
+counties <- tigris::counties("VA", cb = T)
+
+neighborhood_sf <- counties %>%
+  filter(NAME == "Fairfax" | NAME == "Alexandria" | NAME == "Arlington" | NAME == "Falls Church")
+
+ggplot() +
+  geom_sf(data = neighborhood_sf) + 
+  theme_void()
+
+```
+
+Next we'll use the Google Maps API to locate chicken restaurants in the area. For this we'll need the polygon's centroid and a search radius. 
+```{r}
+neighborhood_union <- neighborhood_sf %>%
+  st_union()
+
+neighborhood_diameter <- neighborhood_union %>%
+  st_area() %>%
+  sqrt() %>%
+  as.numeric() 
+
+neighborhood_centroid <- neighborhood_union %>%
+  st_centroid(geometry) %>%
+  st_coordinates()
+```
+
+Since the API only returns 20 results per search and a maximum of 60 results overall, we'll run the search three times and append the result into a one data frame. 
+```{r}
+chicken <- google_places(search_string = 'peruvian chicken', location=c(neighborhood_centroid[2], neighborhood_centroid[1]), radius=(neighborhood_diameter/2), key=gmap_key)
+
+chicken2 <- google_places(search_string = 'peruvian chicken', location=c(neighborhood_centroid[2], neighborhood_centroid[1]), radius=(neighborhood_diameter/2), key=gmap_key, page_token = chicken$next_page_token)
+
+chicken3 <- google_places(search_string = 'peruvian chicken', location=c(neighborhood_centroid[2], neighborhood_centroid[1]), radius=(neighborhood_diameter/2), key=gmap_key, page_token = chicken2$next_page_token)
+
+neighborhood_chicken <- bind_rows(chicken$results, chicken2$results, chicken3$results) %>%
+  distinct(name, formatted_address, .keep_all = T) 
+```
+
+Let's visualize our chicken results within the neighborhood boundaries 
+```{r}
+neighborhood_chicken_sf <- neighborhood_chicken  %>% 
+  mutate(lat = geometry$location$lat,
+         lng = geometry$location$lng) %>%
+  st_as_sf(coords = c("lng", "lat"), crs = st_crs(neighborhood_sf)) %>%
+  st_intersection(neighborhood_sf)
+
+ggplot() + 
+  geom_sf(data = neighborhood_chicken_sf) +
+  geom_sf(data = neighborhood_sf, fill = NA) + 
+  theme_void()
+
+```
+
+Let's visualize concentrations of the Peruvian diaspora in VA. 
+```{r, results = F}
+neighborhood <- c("Falls Church City", "Alexandria City", "Arlington", "Fairfax", "Fairfax City")
+
+nova_peru <- get_acs(geography = "tract", 
+                   state = "VA",
+                   year = 2019, 
+                   survey = 'acs5',
+                   variables = c(hispanic = "B03001_001",
+                                 not_hispanic = "B03001_002",
+                                 peruvian = "B03001_023"),
+                   geometry = T,
+                   cache_table = T) %>%
+  separate(NAME, into = c("tract", "county", "state"), sep = ", ") %>%
+  mutate(county = str_remove(county, " County"),
+         county = str_replace(county, "city", "City")) %>%
+  filter(county %in% neighborhood)
+
+
+nova_peru_clean <- nova_peru %>%
+  mutate(group = ifelse(variable == "hispanic" | variable == "not_hispanic", "total", "peruvian")) %>%
+  group_by(GEOID, tract, group) %>%
+  mutate(county_tract = str_replace(paste0(county, tract), "Census Tract ", ", "),
+         pop_est = sum(estimate),
+         pop_est_moe = moe_sum(moe, estimate)) %>%
+  as.data.frame() %>% 
+  filter(variable == "hispanic" | variable == "peruvian") %>%
+  select(-state, -variable, -county, -tract) %>%
+  pivot_wider(id_cols = c(GEOID, geometry, county_tract), names_from = group, values_from = c(pop_est, pop_est_moe)) %>%
+  mutate(peruvian_prp = round(pop_est_peruvian / pop_est_total, 3),
+         peruvian_moe = round(moe_prop(pop_est_peruvian, pop_est_total, pop_est_moe_peruvian, pop_est_moe_total), 1)) %>%
+  st_as_sf(crs = st_crs(neighborhood_sf))
+
+```
+
+Let's visualize where concentrations of Peruvian populations live in the communities around Alexandria and Arlington. 
+```{r}
+nova_peru_map <- ggplot(nova_peru_clean, aes(fill = pop_est_peruvian)) + 
+  geom_sf_interactive(aes(data_id = county_tract)) +
+  scale_fill_distiller(palette = "Blues", 
+                       direction = 1, 
+                       guide = "none") +
+  theme_void()
+
+nova_peru_15_plot <- nova_peru_clean %>%
+  arrange(desc(pop_est_peruvian)) %>%
+  top_n(15, pop_est_peruvian) %>%
+  ggplot(aes(x = pop_est_peruvian, y = reorder(county_tract, pop_est_peruvian), fill = pop_est_peruvian)) +
+  geom_errorbar(aes(xmin = pop_est_peruvian - pop_est_moe_peruvian, xmax = pop_est_peruvian + pop_est_moe_peruvian)) + 
+  geom_point_interactive(color = "black", size = 4, shape = 21, aes(data_id = county_tract)) +
+  scale_fill_distiller(palette = "Blues", direction = 1) + 
+  labs(title = "Top 15 Census Tracts \n by Peruvian Population",
+       subtitle = "2015-2019 American \n Community Survey",
+       y = "",
+       x = "ACS estimate (bars represent margin of error)",
+       fill = "ACS estiamte") + 
+  theme_minimal(base_size = 14)
+
+girafe(ggobj = nova_peru_map + nova_peru_15_plot) %>%
+  girafe_options(opts_hover(css = "fill:cyan;"))
+```
+
+Through visual inspection, we can see several population concentrations. For a more methodical analysis, we'll create neighborhoods using the spdep package, which will allow deeper investigation for spatial autocorrelation. Using the "queen case" contiguity-based neighborhood definition (neighbors are census tracts that share at least one vertex), we see that on average, census tracts in our neighborhood have about 6 neighbors within our area of interest. 
+```{r}
+neighbors <- poly2nb(nova_peru_clean, queen = TRUE)
+
+summary(neighbors)
+```
+
+Next we can test for local spatial autocorrelation to identify hotspots of Peruvian population. Let's also overlay our chicken restaurants to see if there is a recognizable pattern between hotspots and restaurants. 
+```{r}
+localg_weights <- nb2listw(include.self(neighbors))
+
+nova_peru_clean$localG <- localG(nova_peru_clean$pop_est_peruvian, localg_weights)
+
+nova_peru_clean <- nova_peru_clean %>%
+  mutate(hotspot = case_when(
+    localG >= 2 ~ "High Cluster", 
+    localG <= -2 ~ "Low Cluster",
+    TRUE ~ "None"
+  ))
+
+pal <- colorFactor(
+  palette = c("Grey", "Cyan"),
+  domain = nova_peru_clean$hotspot,
+  reverse = T)
+
+leaflet() %>%
+  addProviderTiles(providers$Stamen.TonerLite) %>%
+  addPolygons(data = nova_peru_clean,
+              color = ~pal(hotspot),
+              weight = 0.5,
+              smoothFactor = 0.2,
+              fillOpacity = 0.5,
+              label = ~county_tract) %>%
+  addCircleMarkers(data = neighborhood_chicken_sf$geometry, popup = neighborhood_chicken_sf$name, label = neighborhood_chicken_sf$name) %>%
+  addLegend(
+    position = "bottomright",
+    pal = pal,
+    values = nova_peru_clean$hotspot,
+    title = "Hot Spots Peruvian Population"
+  )
+
+```
+
+
+
+
